@@ -9,10 +9,8 @@ Features:
 """
 from __future__ import annotations
 import os
-import json
 import hmac
 import logging
-import textwrap
 
 import yaml
 import requests
@@ -45,7 +43,6 @@ SCREENS_FILE = "/app/screens.yaml"
 
 
 def _load_screens() -> dict:
-    """Загружает конфигурацию экранов из YAML-файла."""
     try:
         with open(SCREENS_FILE, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
@@ -61,11 +58,10 @@ SCREENS = _load_screens()
 # ==============================================================================
 # СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ
 # ==============================================================================
-_USER_LAST_MID: dict[int, str] = {}          # ID последнего сообщения для удаления
-_USER_HISTORY: dict[int, list[str]] = {}     # Стек истории экранов для кнопки "Назад"
-_IMAGE_TOKEN_CACHE: dict[str, str] = {}      # Кэш токенов загруженных фото
+_USER_LAST_MID: dict[int, str] = {}
+_USER_HISTORY: dict[int, list[str]] = {}
+_IMAGE_TOKEN_CACHE: dict[str, str] = {}
 
-# Специальные payload для автоматических кнопок
 BACK_PAYLOAD = "__BACK__"
 HOME_PAYLOAD = "__HOME__"
 
@@ -79,7 +75,6 @@ def _get_auth_headers() -> dict:
 
 
 def _get_request_params(user_id: int | None, chat_id: int | None, chat_type: str | None) -> dict:
-    """Определяет правильные query-параметры для API MAX."""
     ct = (chat_type or "").strip().lower()
     if ct == "dialog" and user_id:
         return {"user_id": user_id}
@@ -93,7 +88,6 @@ def _get_request_params(user_id: int | None, chat_id: int | None, chat_type: str
 
 
 def _build_keyboard(buttons_data: list[list[dict]]) -> dict:
-    """Собирает клавиатуру, поддерживая как callback, так и link кнопки."""
     keyboard = []
     for row in buttons_data:
         keyboard_row = []
@@ -107,19 +101,14 @@ def _build_keyboard(buttons_data: list[list[dict]]) -> dict:
 
 
 def _build_navigation_buttons(user_id: int, current_screen: str) -> list[list[dict]]:
-    """
-    Автоматически строит кнопки навигации в зависимости от истории пользователя.
-    - "Назад" — только если глубина истории > 2.
-    - "Главное меню" — всегда, кроме стартового экрана.
-    """
     history = _USER_HISTORY.get(user_id, [])
     nav_buttons = []
 
     if len(history) > 2:
-        nav_buttons.append([{"text": " 🔙  Назад", "payload": BACK_PAYLOAD}])
+        nav_buttons.append([{"text": "🔙 Назад", "payload": BACK_PAYLOAD}])
 
     if current_screen != "start":
-        nav_buttons.append([{"text": " 🏠  Главное меню", "payload": HOME_PAYLOAD}])
+        nav_buttons.append([{"text": "🏠 Главное меню", "payload": HOME_PAYLOAD}])
 
     return nav_buttons
 
@@ -128,16 +117,10 @@ def _build_navigation_buttons(user_id: int, current_screen: str) -> list[list[di
 # ЗАГРУЗКА МЕДИА
 # ==============================================================================
 def upload_image_from_url(image_url: str) -> str | None:
-    """
-    Загружает изображение по URL в MAX API и возвращает токен.
-    Использует кэш, чтобы не загружать одно и то же фото повторно.
-    """
     if image_url in _IMAGE_TOKEN_CACHE:
-        logger.debug("Используем кэшированный токен для %s", image_url)
         return _IMAGE_TOKEN_CACHE[image_url]
 
     try:
-        # Шаг 1: Получаем URL для загрузки от MAX API
         r = requests.post(
             f"{MAX_API}/uploads",
             params={"type": "image"},
@@ -145,41 +128,36 @@ def upload_image_from_url(image_url: str) -> str | None:
             timeout=15
         )
         if not r.ok:
-            logger.error("Не удалось получить upload URL: %s %s", r.status_code, r.text[:200])
+            logger.error("Не удалось получить upload URL: %s", r.text[:200])
             return None
         upload_url = r.json().get("url")
         if not upload_url:
-            logger.error("В ответе /uploads нет поля 'url': %s", r.text[:200])
+            logger.error("В ответе /uploads нет поля 'url'")
             return None
 
-        # Шаг 2: Скачиваем изображение по исходному URL
         img_response = requests.get(image_url, timeout=30, stream=True)
         if not img_response.ok:
             logger.error("Не удалось скачать изображение %s: %s", image_url, img_response.status_code)
             return None
 
-        # Определяем имя файла
         filename = image_url.split("/")[-1].split("?")[0] or "image.jpg"
         valid_ext = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".heic", ".tiff")
         if not any(filename.lower().endswith(ext) for ext in valid_ext):
             filename += ".jpg"
 
-        # Шаг 3: Загружаем файл в MAX
         content_type = img_response.headers.get("Content-Type", "image/jpeg")
         files = {"data": (filename, img_response.content, content_type)}
         upload_resp = requests.post(upload_url, files=files, timeout=60)
         if not upload_resp.ok:
-            logger.error("Не удалось загрузить файл в MAX: %s %s", upload_resp.status_code, upload_resp.text[:200])
+            logger.error("Не удалось загрузить файл в MAX: %s", upload_resp.text[:200])
             return None
 
         token = upload_resp.json().get("token")
         if not token:
-            logger.error("В ответе загрузки нет токена: %s", upload_resp.text[:200])
+            logger.error("В ответе загрузки нет токена")
             return None
 
-        # Сохраняем в кэш
         _IMAGE_TOKEN_CACHE[image_url] = token
-        logger.info("Фото успешно загружено: %s -> token=%s...", image_url, token[:20])
         return token
 
     except requests.RequestException as e:
@@ -191,19 +169,17 @@ def upload_image_from_url(image_url: str) -> str | None:
 # API INTERACTIONS
 # ==============================================================================
 def delete_message(message_id: str, user_id: int | None = None, chat_id: int | None = None):
-    """Удаляет сообщение бота."""
     params = {"message_id": str(message_id)}
     params.update(_get_request_params(user_id, chat_id, None))
     try:
         r = requests.delete(f"{MAX_API}/messages", headers=_get_auth_headers(), params=params, timeout=10)
         if not r.ok:
-            logger.warning("Ошибка удаления %s: %s", message_id, r.text[:100])
+            logger.warning("Ошибка удаления сообщения %s", message_id)
     except requests.RequestException as e:
         logger.error("Network error deleting message: %s", e)
 
 
 def send_message(user_id: int | None, chat_id: int | None, chat_type: str | None, body: dict) -> str | None:
-    """Отправляет сообщение и возвращает его MID."""
     params = _get_request_params(user_id, chat_id, chat_type)
     if not params:
         logger.error("Cannot send message: missing user_id and chat_id")
@@ -226,93 +202,68 @@ def send_message(user_id: int | None, chat_id: int | None, chat_type: str | None
 def navigate_to(user_id: int, user_name: str, screen_id: str,
                 chat_id: int | None = None, chat_type: str | None = None,
                 is_back: bool = False):
-    """Универсальная функция отрисовки любого экрана с поддержкой фото."""
     screen = SCREENS.get(screen_id)
     if not screen:
         logger.error("Экран '%s' не найден в YAML!", screen_id)
         return
 
-    # 1. Удаляем старое сообщение
     if prev_mid := _USER_LAST_MID.get(user_id):
         delete_message(prev_mid, user_id=user_id, chat_id=chat_id)
 
-    # 2. Форматируем текст
     text = screen.get("text", "").format(name=user_name)
     body = {"text": text}
     if "format" in screen:
         body["format"] = screen["format"]
 
-    # 3. Собираем вложения (фото + клавиатура)
     attachments = []
 
-    # 3.1. Если есть фото — загружаем и добавляем
     image_url = screen.get("image")
     if image_url:
         token = upload_image_from_url(image_url)
         if token:
             attachments.append({"type": "image", "payload": {"token": token}})
         else:
-            logger.warning("Не удалось загрузить фото для экрана '%s', отправим без него", screen_id)
+            logger.warning("Не удалось загрузить фото для экрана '%s'", screen_id)
 
     if user_id not in _USER_HISTORY:
         _USER_HISTORY[user_id] = []
-    
+
     if not is_back:
-        # Добавляем экран в историю, если его там ещё нет на последнем месте
         if not _USER_HISTORY[user_id] or _USER_HISTORY[user_id][-1] != screen_id:
             _USER_HISTORY[user_id].append(screen_id)
-    
-    # Ограничиваем глубину истории
+
     if len(_USER_HISTORY[user_id]) > 10:
         _USER_HISTORY[user_id] = _USER_HISTORY[user_id][-10:]
 
-    # 3.3. Теперь история уже актуальная — собираем кнопки
     user_buttons = list(screen.get("buttons", []))
     nav_buttons = _build_navigation_buttons(user_id, screen_id)
     all_buttons = user_buttons + nav_buttons
     if all_buttons:
         attachments.append(_build_keyboard(all_buttons)["attachments"][0])
 
-    # 3.4. Добавляем все вложения в тело сообщения
     if attachments:
         body["attachments"] = attachments
 
-    # 4. Отправляем сообщение
     new_mid = send_message(user_id, chat_id, chat_type, body)
     if new_mid:
         _USER_LAST_MID[user_id] = new_mid
-        
-        
+
+
 def handle_back_navigation(user_id: int, user_name: str,
                            chat_id: int | None = None, chat_type: str | None = None):
-    """Обрабатывает нажатие кнопки '__BACK__'."""
     history = _USER_HISTORY.get(user_id, [])
-    
-    # Если история пустая или в ней только один элемент (start), ничего делать не нужно
+
     if len(history) <= 1:
         return
 
-    # Удаляем ТЕКУЩИЙ экран из истории
     history.pop()
-    
-    # Берём предыдущий экран из истории
     prev_screen = history[-1]
-    
-    logger.info("Возврат пользователя %s на экран: %s (история: %s)", user_id, prev_screen, history)
-    
-    # ВАЖНО: Передаём is_back=True, чтобы navigate_to не добавлял этот экран повторно в историю
     navigate_to(user_id, user_name, prev_screen, chat_id, chat_type, is_back=True)
 
 
 def handle_home_navigation(user_id: int, user_name: str,
                            chat_id: int | None = None, chat_type: str | None = None):
-    """Обрабатывает нажатие кнопки '__HOME__' — возврат в главное меню."""
-    logger.info("Возврат пользователя %s в главное меню", user_id)
-    
-    # Жестко сбрасываем историю до корня
     _USER_HISTORY[user_id] = ["start"]
-    
-    # Переходим на start с флагом is_back=True, чтобы он не дублировался в истории
     navigate_to(user_id, user_name, "start", chat_id, chat_type, is_back=True)
 
 
@@ -333,9 +284,6 @@ def _handle_callback(data: dict) -> tuple:
     if not user_id:
         return jsonify({"ok": True}), 200
 
-    logger.info("Кнопка нажата: payload='%s', user=%s", payload, user_name)
-
-    # ВАЖНО: удаление сообщения происходит внутри navigate_to, здесь не дублируем (фикс бага)
     if payload == BACK_PAYLOAD:
         handle_back_navigation(user_id, user_name, chat_id, chat_type)
     elif payload == HOME_PAYLOAD:
@@ -353,7 +301,6 @@ def _handle_bot_started(data: dict) -> tuple:
     user = data.get("user", {})
     if user_id := user.get("user_id"):
         user_name = user.get("first_name") or user.get("username") or "Пользователь"
-        logger.info("Бот запущен пользователем: %s", user_name)
         navigate_to(user_id, user_name, "start")
     return jsonify({"ok": True}), 200
 
@@ -373,7 +320,6 @@ def _handle_message_created(data: dict) -> tuple:
     text = (body.get("text") or "").strip().lower()
 
     if user_id and text:
-        logger.info("Сообщение от %s: '%s'", user_name, text)
         navigate_to(user_id, user_name, "start", chat_id, chat_type)
 
     return jsonify({"ok": True}), 200
