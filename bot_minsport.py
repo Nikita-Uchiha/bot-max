@@ -270,38 +270,49 @@ def navigate_to(user_id: int, user_name: str, screen_id: str,
     if new_mid:
         _USER_LAST_MID[user_id] = new_mid
 
-    # 5. Управление историей
+    # 5. Управление историей (ИСПРАВЛЕННАЯ ЛОГИКА)
     if user_id not in _USER_HISTORY:
         _USER_HISTORY[user_id] = []
+        
+    # Если мы НЕ делаем возврат назад, то добавляем новый экран в историю
     if not is_back:
         _USER_HISTORY[user_id].append(screen_id)
+    
+    # Ограничиваем глубину истории максимум 10 шагами, чтобы не росла бесконечно
+    if len(_USER_HISTORY[user_id]) > 10:
+        _USER_HISTORY[user_id] = _USER_HISTORY[user_id][-10:]
 
 
 def handle_back_navigation(user_id: int, user_name: str,
                            chat_id: int | None = None, chat_type: str | None = None):
     """Обрабатывает нажатие кнопки '__BACK__'."""
     history = _USER_HISTORY.get(user_id, [])
+    
+    # Если история пустая или в ней только один элемент (start), ничего делать не нужно
+    if len(history) <= 1:
+        return
 
-    # Удаляем текущий экран из истории
-    if len(history) > 1:
-        history.pop()
-
-    # Если история опустела или осталась только "start", идём на старт
-    if not history or (len(history) == 1 and history[0] == "start"):
-        logger.info("Возврат на start для пользователя %s", user_id)
-        _USER_HISTORY[user_id] = ["start"]
-        navigate_to(user_id, user_name, "start", chat_id, chat_type, is_back=True)
-    else:
-        prev_screen = history[-1]
-        logger.info("Возврат пользователя %s на экран: %s", user_id, prev_screen)
-        navigate_to(user_id, user_name, prev_screen, chat_id, chat_type, is_back=True)
+    # Удаляем ТЕКУЩИЙ экран из истории
+    history.pop()
+    
+    # Берём предыдущий экран из истории
+    prev_screen = history[-1]
+    
+    logger.info("Возврат пользователя %s на экран: %s (история: %s)", user_id, prev_screen, history)
+    
+    # ВАЖНО: Передаём is_back=True, чтобы navigate_to не добавлял этот экран повторно в историю
+    navigate_to(user_id, user_name, prev_screen, chat_id, chat_type, is_back=True)
 
 
 def handle_home_navigation(user_id: int, user_name: str,
                            chat_id: int | None = None, chat_type: str | None = None):
     """Обрабатывает нажатие кнопки '__HOME__' — возврат в главное меню."""
     logger.info("Возврат пользователя %s в главное меню", user_id)
+    
+    # Жестко сбрасываем историю до корня
     _USER_HISTORY[user_id] = ["start"]
+    
+    # Переходим на start с флагом is_back=True, чтобы он не дублировался в истории
     navigate_to(user_id, user_name, "start", chat_id, chat_type, is_back=True)
 
 
