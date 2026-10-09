@@ -1,14 +1,21 @@
 """
 Chat Bot for MAX Messenger API
-Features: Data-driven screens, navigation history (Back button), external links.
+Features:
+  - YAML-driven content (screens.yaml)
+  - Auto-navigation buttons (Back / Home)
+  - Image loading from URLs with caching
+  - Markdown formatting support
+  - Message deletion for app-like UX
 """
 from __future__ import annotations
 import os
 import json
 import hmac
 import logging
-import requests
 import textwrap
+
+import yaml
+import requests
 from flask import Flask, request, jsonify
 
 # ==============================================================================
@@ -31,96 +38,36 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 TOKEN = os.environ.get("MAX_BOT_TOKEN", "").strip()
 USE_BEARER = os.environ.get("MAX_USE_BEARER", "").lower() in ("1", "true", "yes")
 
-# Хранилища состояния пользователей
+# ==============================================================================
+# ЗАГРУЗКА КОНТЕНТА ИЗ YAML
+# ==============================================================================
+SCREENS_FILE = "/app/screens.yaml"
+
+
+def _load_screens() -> dict:
+    """Загружает конфигурацию экранов из YAML-файла."""
+    try:
+        with open(SCREENS_FILE, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        logger.info("Загружено экранов из YAML: %d", len(data))
+        return data
+    except Exception as e:
+        logger.error("Ошибка загрузки screens.yaml: %s", e)
+        return {}
+
+
+SCREENS = _load_screens()
+
+# ==============================================================================
+# СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ
+# ==============================================================================
 _USER_LAST_MID: dict[int, str] = {}          # ID последнего сообщения для удаления
 _USER_HISTORY: dict[int, list[str]] = {}     # Стек истории экранов для кнопки "Назад"
+_IMAGE_TOKEN_CACHE: dict[str, str] = {}      # Кэш токенов загруженных фото
 
-
-# ==============================================================================
-# КОНФИГУРАЦИЯ ЭКРАНОВ (МЕНЮ)
-# ==============================================================================
-# !!! ДОБАВЛЯЙ НОВЫЕ ЭКРАНЫ СЮДА. Не нужно трогать основной код. !!!
-# Доступные типы кнопок: 
-# 1. {"text": "Текст", "payload": "уникальный_id"} -> вызывает переход внутри бота
-# 2. {"text": "Текст", "type": "link", "url": "https://..."} -> открывает сайт (MAX обрабатывает сам)
-SCREENS = {
-    "start": {
-        "text": textwrap.dedent("""\
-            Привет, {name}!
-            Вас приветствует бот-помощник Минспорта Оренбургской области.
-            Чем я могу помочь?
-
-            Выберите категорию, которая Вас интересует:
-        """).strip(),
-        "buttons": [
-            [{"text": "Спортивные звания", "payload": "saports_titles"}],
-            [{"text": "🌐 Наш сайт", "type": "link", "url": "https://minsport.orb.ru"}]
-        ]
-        # ⬆️ Здесь нет ни "Назад", ни "Главное меню" — они появятся автоматически,
-        # но только когда пользователь уйдёт со стартового экрана.
-    },
-    "saports_titles": {
-        "text": "Спортивные звания",
-        "buttons": [
-            [{"text": "ЕВСК", "type": "link", "url": "https://www.minsport.gov.ru/activity/government-regulation/evsk/"}],
-            [{"text": "Нормы и требования выполнения", "payload": "saports_titles_btn1"}],
-            [{"text": "Мастер спорта России", "payload": "saports_titles_btn2"}],
-            [{"text": "Мастер спорта России международного класса", "payload": "saports_titles_btn3"}],
-            [{"text": "Гроссмейстер России", "payload": "saports_titles_btn4"}],
-            [{"text": "Основания для отказа", "payload": "saports_titles_btn5"}],
-
-        ]
-    },
-    "saports_titles_btn1": {
-        "text": "Нормы и требования выполнения",
-        "buttons": [
-            [{"text": "Летние виды спорта", "type": "link", "url": "https://www.minsport.gov.ru/evsk-2026-2029-letnie-olimpijskie-vidy-sporta/"}],
-            [{"text": "Зимние виды спорта", "type": "link", "url": "https://www.minsport.gov.ru/activity/government-regulation/evsk-2/"}],
-            [{"text": "Неолимпийские виды спорта", "type": "link", "url": "https://www.minsport.gov.ru/evsk-2026-2029-neolimpijskie-vidy-sporta/"}],
-            ]
-    },
-    "saports_titles_btn2": {
-        "text": "Мастер спорта России",
-        "buttons": [
-            [{"text": "Летние виды спорта", "type": "link", "url": "https://www.minsport.gov.ru/evsk-2026-2029-letnie-olimpijskie-vidy-sporta/"}],
-            [{"text": "Зимние виды спорта", "type": "link", "url": "https://www.minsport.gov.ru/activity/government-regulation/evsk-2/"}],
-            [{"text": "Неолимпийские виды спорта", "type": "link", "url": "https://www.minsport.gov.ru/evsk-2026-2029-neolimpijskie-vidy-sporta/"}],
-            [{"text": "Список документов", "payload": "saports_titles_btn2_1"}],
-            ]
-    },
-    "saports_titles_btn2_": {
-        "text": textwrap.dedent("""\
-            1) копия протокола или выписка из протокола соревнования, подписанного председателем главной судейской коллегии соревнования (главным судьей);
-
-            2) копия справки о составе и квалификации судейской коллегии, подписанной председателем главной судейской коллегии соревнования (главным судьей) (за исключением международных соревнований);
-
-            3) копии удостоверений «спортивный судья всероссийской категории;
-
-            4) две фотографии размером 3х4 см;
-
-            5) копии 2-3 страниц паспорта гражданина РФ, а также копии страниц, содержащих сведения о месте жительства (или иной документ, подтверждающий личность);
-
-            6) копия положения (регламента) о физкультурном мероприятии и (или) спортивном соревновании по военно-прикладным и служебно-прикладным видам спорта, на котором спортсмен выполнил нормы, требования и условия их выполнения для присвоения спортивного звания (для военно-прикладных и служебно-прикладных видов спорта);
-
-            7) копия документа (справка, протокол), подписанного председателем главной судейской коллегии соревнования (главным судьей), содержащего сведения о количестве стран (для международных соревнований) или субъектов РФ (для всероссийских и межрегиональных соревнований), принявших участие в соответствующем соревновании;
-
-            8) копия документа или выписка о присвоении (подтверждении) спортивного разряда;
-
-            В случае приостановления действия государственной аккредитации региональной спортивной федерации:
-
-            9) копия документа, удостоверяющего принадлежность спортсмена к физкультурно-спортивной организации, организации;
-
-            10) копия документа регионального министерства/ведомства о приостановлении действия государственной аккредитации региональной спортивной федерации.
-
-            Для лиц, не достигших возраста 14 лет, – копия свидетельства о рождении.
-        """).strip(),
-        "buttons": []
-    },
-    "cat2": {
-        "text": "Вы в Категории 2.",
-        "buttons": []
-    }
-}
+# Специальные payload для автоматических кнопок
+BACK_PAYLOAD = "__BACK__"
+HOME_PAYLOAD = "__HOME__"
 
 
 # ==============================================================================
@@ -132,11 +79,16 @@ def _get_auth_headers() -> dict:
 
 
 def _get_request_params(user_id: int | None, chat_id: int | None, chat_type: str | None) -> dict:
+    """Определяет правильные query-параметры для API MAX."""
     ct = (chat_type or "").strip().lower()
-    if ct == "dialog" and user_id: return {"user_id": user_id}
-    if ct in ("chat", "channel", "group") and chat_id: return {"chat_id": chat_id}
-    if user_id: return {"user_id": user_id}
-    if chat_id: return {"chat_id": chat_id}
+    if ct == "dialog" and user_id:
+        return {"user_id": user_id}
+    if ct in ("chat", "channel", "group") and chat_id:
+        return {"chat_id": chat_id}
+    if user_id:
+        return {"user_id": user_id}
+    if chat_id:
+        return {"chat_id": chat_id}
     return {}
 
 
@@ -151,14 +103,95 @@ def _build_keyboard(buttons_data: list[list[dict]]) -> dict:
             else:
                 keyboard_row.append({"type": "callback", "text": btn["text"], "payload": btn["payload"]})
         keyboard.append(keyboard_row)
-    
     return {"attachments": [{"type": "inline_keyboard", "payload": {"buttons": keyboard}}]}
+
+
+def _build_navigation_buttons(user_id: int, current_screen: str) -> list[list[dict]]:
+    """
+    Автоматически строит кнопки навигации в зависимости от истории пользователя.
+    - "Назад" — только если глубина истории > 2.
+    - "Главное меню" — всегда, кроме стартового экрана.
+    """
+    history = _USER_HISTORY.get(user_id, [])
+    nav_buttons = []
+
+    if len(history) > 2:
+        nav_buttons.append([{"text": "◀️ Назад", "payload": BACK_PAYLOAD}])
+
+    if current_screen != "start":
+        nav_buttons.append([{"text": "🏠 Главное меню", "payload": HOME_PAYLOAD}])
+
+    return nav_buttons
+
+
+# ==============================================================================
+# ЗАГРУЗКА МЕДИА
+# ==============================================================================
+def upload_image_from_url(image_url: str) -> str | None:
+    """
+    Загружает изображение по URL в MAX API и возвращает токен.
+    Использует кэш, чтобы не загружать одно и то же фото повторно.
+    """
+    if image_url in _IMAGE_TOKEN_CACHE:
+        logger.debug("Используем кэшированный токен для %s", image_url)
+        return _IMAGE_TOKEN_CACHE[image_url]
+
+    try:
+        # Шаг 1: Получаем URL для загрузки от MAX API
+        r = requests.post(
+            f"{MAX_API}/uploads",
+            params={"type": "image"},
+            headers={"Authorization": _get_auth_headers()["Authorization"]},
+            timeout=15
+        )
+        if not r.ok:
+            logger.error("Не удалось получить upload URL: %s %s", r.status_code, r.text[:200])
+            return None
+        upload_url = r.json().get("url")
+        if not upload_url:
+            logger.error("В ответе /uploads нет поля 'url': %s", r.text[:200])
+            return None
+
+        # Шаг 2: Скачиваем изображение по исходному URL
+        img_response = requests.get(image_url, timeout=30, stream=True)
+        if not img_response.ok:
+            logger.error("Не удалось скачать изображение %s: %s", image_url, img_response.status_code)
+            return None
+
+        # Определяем имя файла
+        filename = image_url.split("/")[-1].split("?")[0] or "image.jpg"
+        valid_ext = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".heic", ".tiff")
+        if not any(filename.lower().endswith(ext) for ext in valid_ext):
+            filename += ".jpg"
+
+        # Шаг 3: Загружаем файл в MAX
+        content_type = img_response.headers.get("Content-Type", "image/jpeg")
+        files = {"data": (filename, img_response.content, content_type)}
+        upload_resp = requests.post(upload_url, files=files, timeout=60)
+        if not upload_resp.ok:
+            logger.error("Не удалось загрузить файл в MAX: %s %s", upload_resp.status_code, upload_resp.text[:200])
+            return None
+
+        token = upload_resp.json().get("token")
+        if not token:
+            logger.error("В ответе загрузки нет токена: %s", upload_resp.text[:200])
+            return None
+
+        # Сохраняем в кэш
+        _IMAGE_TOKEN_CACHE[image_url] = token
+        logger.info("Фото успешно загружено: %s -> token=%s...", image_url, token[:20])
+        return token
+
+    except requests.RequestException as e:
+        logger.exception("Сетевая ошибка при загрузке фото %s: %s", image_url, e)
+        return None
 
 
 # ==============================================================================
 # API INTERACTIONS
 # ==============================================================================
 def delete_message(message_id: str, user_id: int | None = None, chat_id: int | None = None):
+    """Удаляет сообщение бота."""
     params = {"message_id": str(message_id)}
     params.update(_get_request_params(user_id, chat_id, None))
     try:
@@ -170,6 +203,7 @@ def delete_message(message_id: str, user_id: int | None = None, chat_id: int | N
 
 
 def send_message(user_id: int | None, chat_id: int | None, chat_type: str | None, body: dict) -> str | None:
+    """Отправляет сообщение и возвращает его MID."""
     params = _get_request_params(user_id, chat_id, chat_type)
     if not params:
         logger.error("Cannot send message: missing user_id and chat_id")
@@ -189,89 +223,87 @@ def send_message(user_id: int | None, chat_id: int | None, chat_type: str | None
 # ==============================================================================
 # NAVIGATION ENGINE
 # ==============================================================================
-# Специальные payload для автоматических кнопок
-BACK_PAYLOAD = "__BACK__"
-HOME_PAYLOAD = "__HOME__"
-
-def navigate_to(user_id: int, user_name: str, screen_id: str, chat_id: int | None = None, chat_type: str | None = None, is_back: bool = False):
-    """Универсальная функция отрисовки любого экрана с автоматической навигацией."""
+def navigate_to(user_id: int, user_name: str, screen_id: str,
+                chat_id: int | None = None, chat_type: str | None = None,
+                is_back: bool = False):
+    """Универсальная функция отрисовки любого экрана с поддержкой фото."""
     screen = SCREENS.get(screen_id)
     if not screen:
-        logger.error("Экран '%s' не найден в конфигурации!", screen_id)
+        logger.error("Экран '%s' не найден в YAML!", screen_id)
         return
 
     # 1. Удаляем старое сообщение
     if prev_mid := _USER_LAST_MID.get(user_id):
         delete_message(prev_mid, user_id=user_id, chat_id=chat_id)
 
-    # 2. Форматируем текст (подставляем имя)
-    text = screen["text"].format(name=user_name)
+    # 2. Форматируем текст
+    text = screen.get("text", "").format(name=user_name)
     body = {"text": text}
     if "format" in screen:
         body["format"] = screen["format"]
 
-    # 3. Собираем кнопки: свои + автоматические навигационные
-    user_buttons = list(screen.get("buttons", []))  # Копия кнопок из SCREENS
+    # 3. Собираем вложения (фото + клавиатура)
+    attachments = []
+
+    # 3.1. Если есть фото — загружаем и добавляем
+    image_url = screen.get("image")
+    if image_url:
+        token = upload_image_from_url(image_url)
+        if token:
+            attachments.append({"type": "image", "payload": {"token": token}})
+        else:
+            logger.warning("Не удалось загрузить фото для экрана '%s', отправим без него", screen_id)
+
+    # 3.2. Собираем кнопки (свои + автоматические навигационные)
+    user_buttons = list(screen.get("buttons", []))
     nav_buttons = _build_navigation_buttons(user_id, screen_id)
-    
-    # Объединяем: сначала свои кнопки, потом навигационные
     all_buttons = user_buttons + nav_buttons
     if all_buttons:
-        body.update(_build_keyboard(all_buttons))
+        attachments.append(_build_keyboard(all_buttons)["attachments"][0])
 
-    # 4. Отправляем новое сообщение
+    # 3.3. Добавляем все вложения в тело сообщения
+    if attachments:
+        body["attachments"] = attachments
+
+    # 4. Отправляем сообщение
     new_mid = send_message(user_id, chat_id, chat_type, body)
     if new_mid:
         _USER_LAST_MID[user_id] = new_mid
 
-    # 5. Управление историей (стеком)
+    # 5. Управление историей
     if user_id not in _USER_HISTORY:
         _USER_HISTORY[user_id] = []
-    
     if not is_back:
         _USER_HISTORY[user_id].append(screen_id)
 
 
-def _build_navigation_buttons(user_id: int, current_screen: str) -> list[list[dict]]:
-    """
-    Автоматически строит кнопки навигации в зависимости от истории пользователя.
-    - "Главное меню" — всегда, кроме стартового экрана.
-    - "Назад" — только если глубина истории > 1.
-    """
-    history = _USER_HISTORY.get(user_id, [])
-    nav_buttons = []
-    
-    # Кнопка "Назад" — только если мы не на стартовом экране
-    if len(history) > 2:
-        nav_buttons.append([{"text": "◀️ Назад", "payload": BACK_PAYLOAD}])
-    
-    # Кнопка "Главное меню" — всегда, кроме самого старта
-    if current_screen != "start":
-        nav_buttons.append([{"text": "🏠 Главное меню", "payload": HOME_PAYLOAD}])
-    
-    return nav_buttons
-
-
-def handle_back_navigation(user_id: int, user_name: str, chat_id: int | None = None, chat_type: str | None = None):
+def handle_back_navigation(user_id: int, user_name: str,
+                           chat_id: int | None = None, chat_type: str | None = None):
     """Обрабатывает нажатие кнопки '__BACK__'."""
     history = _USER_HISTORY.get(user_id, [])
-    
+
+    # Удаляем текущий экран из истории
     if len(history) > 1:
-        history.pop()  # Удаляем текущий экран
+        history.pop()
+
+    # Если история опустела или осталась только "start", идём на старт
+    if not history or (len(history) == 1 and history[0] == "start"):
+        logger.info("Возврат на start для пользователя %s", user_id)
+        _USER_HISTORY[user_id] = ["start"]
+        navigate_to(user_id, user_name, "start", chat_id, chat_type, is_back=True)
+    else:
         prev_screen = history[-1]
         logger.info("Возврат пользователя %s на экран: %s", user_id, prev_screen)
         navigate_to(user_id, user_name, prev_screen, chat_id, chat_type, is_back=True)
-    else:
-        logger.info("История пуста, возврат на start для пользователя %s", user_id)
-        _USER_HISTORY[user_id] = ["start"]
-        navigate_to(user_id, user_name, "start", chat_id, chat_type, is_back=True)
 
 
-def handle_home_navigation(user_id: int, user_name: str, chat_id: int | None = None, chat_type: str | None = None):
+def handle_home_navigation(user_id: int, user_name: str,
+                           chat_id: int | None = None, chat_type: str | None = None):
     """Обрабатывает нажатие кнопки '__HOME__' — возврат в главное меню."""
     logger.info("Возврат пользователя %s в главное меню", user_id)
-    _USER_HISTORY[user_id] = ["start"]  # Сбрасываем историю
+    _USER_HISTORY[user_id] = ["start"]
     navigate_to(user_id, user_name, "start", chat_id, chat_type, is_back=True)
+
 
 # ==============================================================================
 # WEBHOOK HANDLERS
@@ -282,9 +314,7 @@ def _handle_callback(data: dict) -> tuple:
     user_id = user.get("user_id")
     user_name = user.get("first_name") or user.get("username") or "Пользователь"
     payload = callback.get("payload")
-    message_id = data.get("message", {}).get("body", {}).get("mid")
-    
-    # Извлекаем chat_id и chat_type из контекста сообщения, если они там есть
+
     msg_recipient = data.get("message", {}).get("recipient", {})
     chat_id = msg_recipient.get("chat_id")
     chat_type = msg_recipient.get("chat_type")
@@ -293,12 +323,8 @@ def _handle_callback(data: dict) -> tuple:
         return jsonify({"ok": True}), 200
 
     logger.info("Кнопка нажата: payload='%s', user=%s", payload, user_name)
-    
-    if message_id:
-        delete_message(message_id, user_id=user_id, chat_id=chat_id)
 
-    # Маршрутизация без if/else лапши
-    # Маршрутизация без if/else лапши
+    # ВАЖНО: удаление сообщения происходит внутри navigate_to, здесь не дублируем (фикс бага)
     if payload == BACK_PAYLOAD:
         handle_back_navigation(user_id, user_name, chat_id, chat_type)
     elif payload == HOME_PAYLOAD:
@@ -317,7 +343,7 @@ def _handle_bot_started(data: dict) -> tuple:
     if user_id := user.get("user_id"):
         user_name = user.get("first_name") or user.get("username") or "Пользователь"
         logger.info("Бот запущен пользователем: %s", user_name)
-        _USER_HISTORY[user_id] = ["start"] # Инициализируем историю
+        _USER_HISTORY[user_id] = ["start"]
         navigate_to(user_id, user_name, "start")
     return jsonify({"ok": True}), 200
 
@@ -326,7 +352,7 @@ def _handle_message_created(data: dict) -> tuple:
     msg = data.get("message", {})
     sender = msg.get("sender", {})
     body = msg.get("body", {})
-    
+
     if not sender or sender.get("is_bot"):
         return jsonify({"ok": True}), 200
 
@@ -340,7 +366,7 @@ def _handle_message_created(data: dict) -> tuple:
         logger.info("Сообщение от %s: '%s'", user_name, text)
         _USER_HISTORY[user_id] = ["start"]
         navigate_to(user_id, user_name, "start", chat_id, chat_type)
-        
+
     return jsonify({"ok": True}), 200
 
 
@@ -380,7 +406,7 @@ def health():
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Ошибка: Не задана переменная окружения MAX_BOT_TOKEN")
-    
+
     port = int(os.environ.get("PORT", "3000"))
     logger.info("Запуск сервера на порту %d", port)
     app.run(host="0.0.0.0", port=port)
